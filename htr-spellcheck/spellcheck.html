@@ -1,0 +1,800 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>SpellCheck</title>
+
+<!-- <script type="text/javascript" src="./imgcap01.json"></script> -->
+
+<!-- savedOcrData from here -->
+<!-- <script type="text/javascript" src="./neil-writing-azure.json"></script> -->
+
+<!-- savedSpellcheckResults from here  -->
+<!-- <script type="text/javascript" src="./neil-writing-spellcheck.json"></script> -->
+<script type="text/javascript">
+'use strict';
+
+var spellcheckResults = null;	//savedSpellcheckResults;
+var data = null;	//savedOcrData;
+
+function setDivDisplay(divName, displayOption) {
+	const div = document.getElementById(divName);
+	div.style = "display:" + displayOption;	
+}
+
+const ALLOW_LISTED_WORDS = {
+	"ans": "Short for Answer",
+	"kandekar": "Name"
+}
+
+const MAX_POLLS = 10;
+const POLL_TIMEOUT = 1000;
+
+var AZURE_KEY_OCR = null;
+var AZURE_KEY_SPC = null;
+
+let analyzeLocationUrl = null;
+
+// TODO set dynamically based on https://stackoverflow.com/questions/53233096/how-to-set-html5-canvas-size-to-match-display-size-in-device-pixels
+var displayWidth = 1000;
+var displayHeight = 720;
+
+var xscale = 1.0;
+var yscale = 1.0;
+
+// Access webcam
+var stream = null;
+async function init() {
+	// console.log(data);
+	// loadDefaultImage();
+	var azureKeyOcr = readFromLocalStorage("azureKeyOcr")
+	console.log('azureKeyOcr', azureKeyOcr);
+	if (azureKeyOcr !== undefined) {
+		document.getElementById("azureKeyOcr").value = azureKeyOcr;
+	}
+	var azureKeySpc = readFromLocalStorage("azureKeySpc")
+	console.log('azureKeySpc', azureKeySpc);
+	if (azureKeySpc !== undefined) {
+		document.getElementById("azureKeySpc").value = azureKeySpc;
+	}
+}
+
+function writeToLocalStorage(key, value) {
+	console.log("localStorage: saved key", key)
+	localStorage.setItem(key, value);
+}
+
+function readFromLocalStorage(key) {
+	return localStorage.getItem(key);
+}
+
+function loadDefaultImage(doHighlight=false) {
+    const image = new Image();
+	image.crossOrigin="Anonymous";
+    image.onload = function () {
+    	console.log("loaded");
+		setDivDisplay("camera", "none");
+		setDivDisplay("check", "block");
+		const canvas = document.getElementById('canvas');
+		canvas.width = displayWidth;
+		canvas.height = displayHeight;
+		var ctx = canvas.getContext('2d');
+		// TODO bring this back for dynamic image scaling
+		// xscale = displayWidth / image.width;
+		// yscale = displayHeight / image.height;
+		// console.log('Image dims', image.width, image.height, 'Display dims', displayWidth, displayHeight, 'scale:', xscale, yscale);
+	    ctx.drawImage(image, 0, 0, displayWidth, displayHeight);
+	    // annotateAllText();
+		if (doHighlight) {
+			highlight();
+		}
+    };
+    // image.src = './imgcap01.png';
+    // image.src = "./neil-writing.jpg";
+	// no-cache-please because of caching: https://www.hacksoft.io/blog/handle-images-cors-error-in-chrome
+    image.src = "http://localhost:8000/neil-writing.jpg?not-from-cache-please";
+}
+ 
+
+async function getCamVideoStream() {
+	const constraints = {
+		audio: false,
+		// video: true
+		video: {
+		    width: 320,
+		    height: 480,
+		    facingMode: 'environment'
+		}
+	};
+
+	// const devices = await navigator.mediaDevices.enumerateDevices();
+	// const videoDevices = devices.filter(device => device.kind === 'videoinput');
+	// console.log(videoDevices);
+	// const options = videoDevices.map(videoDevice => {
+	// 	return videoDevice.label;
+	// });
+	// console.log(options);
+
+	// hmlt5 getUserMedia asks permissions multiple times WHY - not on mobile
+	// console.log(navigator);
+	// console.log(navigator.mediaDevices);
+	// console.log(navigator.mediaDevices.getUserMedia(constraints));
+	stream = await navigator.mediaDevices.getUserMedia(constraints);
+	console.log('getCamVideoStream', stream);
+	return stream;
+}
+
+async function start() {
+	if (stream == null) {
+			// permissions
+		stream = await getCamVideoStream();
+		console.log('start', stream);
+		if (stream == null) {
+			setError("Unable to access webcam, maybe due to lack of permissions.");
+			return;
+		}
+	}
+
+	const video = document.getElementById('video');
+	const canvas = document.getElementById('canvas');
+	const snap = document.getElementById("snap");
+
+
+	// setDivDisplay("preload", "none");
+	setDivDisplay("check", "none");
+	setDivDisplay("camera", "block");
+
+    try {
+        startStreaming(video, stream);
+
+		// Draw image
+		var ctx = canvas.getContext('2d');
+		snap.addEventListener("click", function() {
+			setDivDisplay("camera", "none");
+			setDivDisplay("check", "block");
+			displayWidth = canvas.width;
+			displayHeight = canvas.height;
+			console.log("Setting canvas dimensions", displayWidth, displayHeight)
+
+		    ctx.drawImage(video, 0, 0, displayWidth, displayHeight);
+			// pauseStreaming();
+			pauseStreaming();
+			// scan();
+		});
+
+    } catch (e) {
+    	console.log(e);
+        setError(`navigator.getUserMedia error:${e.toString()}`);
+    }
+}
+
+async function stop() {
+	stopStreaming();
+	stream = null;
+}
+
+function setError(msg) {
+	const errorMsgElement = document.querySelector('span#errorMsg');
+	errorMsgElement.innerHTML = msg;
+}
+
+function setNotification(msg) {
+	const notificationElement = document.querySelector('span#notification');
+	notificationElement.innerHTML = msg;
+}
+
+function clearMsgs() {
+	setError("");
+	setNotification("");
+}
+
+async function scan() {
+	AZURE_KEY_OCR = document.getElementById('azureKeyOcr').value;
+	if (!AZURE_KEY_OCR) {
+		setError("MUST SET KEY FOR OCR. Aborting");
+		return;
+	}
+	writeToLocalStorage("azureKeyOcr", AZURE_KEY_OCR);
+	const canvas = document.getElementById('canvas');
+	const imgDataUrl = canvas.toDataURL("image/png");
+	const imgBlob = dataURItoBlob(imgDataUrl);
+	// console.log("Img data is " + imgBlob.length);
+
+	const response = await fetch("https://centralindia.api.cognitive.microsoft.com/vision/v3.2/read/analyze?readingOrder=natural", {
+	  method: 'POST',
+	  headers: {
+		"Content-Type": "application/octet-stream",
+		"Ocp-Apim-Subscription-Key": AZURE_KEY_OCR
+	  },
+	  body: imgBlob
+	})
+	if (!response.ok) {
+		console.log(response.status);
+		alert('Failed to get response for analyze: ' + response.status);
+		return;
+	}
+	console.log(response.headers);
+	analyzeLocationUrl = response.headers.get("operation-location");
+	console.log(analyzeLocationUrl);
+	const oplocTxt = document.getElementById('oploc');
+	oplocTxt.value = analyzeLocationUrl;
+	setNotification("Sending image for scanning...")
+	setTimeout(poll, POLL_TIMEOUT);
+}
+
+async function poll(attempt=0) {	
+	const oplocTxt = document.getElementById('oploc');
+	const oplocUrl = oplocTxt.value;
+	if (oplocUrl !== analyzeLocationUrl) {
+		console.log("Mismatch! analyzeLocationUrl=" + analyzeLocationUrl + " and oplocUrl=" + oplocUrl);
+		setError("Mismatch! analyzeLocationUrl=" + analyzeLocationUrl + " and oplocUrl=" + oplocUrl)
+	}
+	if (!AZURE_KEY_OCR) {
+		setError("MUST SET KEY FOR OCR. Aborting");
+		return;
+	}
+	const response = await fetch(oplocUrl, {
+	  method: 'GET',
+	  headers: {
+		"Content-Type": "application/json",
+		"Ocp-Apim-Subscription-Key": AZURE_KEY_OCR
+	  },
+	})
+	if (!response.ok) {
+		console.log(response.status);
+		setError('Failed to get result for analyze: ' + response.status + ', aborting.');
+		return;
+	}
+	const results = await response.json();
+	console.log(results);
+	if (results.status == 'notStarted' || results.status == 'running') {
+		attempt++;
+		if (attempt < MAX_POLLS) {
+			setNotification("Sending image for scanning, attempt " + attempt + "...");
+			setTimeout(function() { poll(attempt); }, POLL_TIMEOUT)
+			return;
+		} else {
+			setError('No results after ' + MAX_POLLS + ' attempts,  aborting.');			
+		}
+	} else if (results.status == 'failed') {
+		setError('Failed to get result for analyze: ' + response.status + ',  aborting. Details: ' + JSON.stringify(results));
+	} else if (results.status == 'succeeded') {
+		data = results;
+		setNotification('Starting spellcheck...');
+		check();
+	}
+}
+
+function startStreaming(video, stream) {
+	stream.getTracks().forEach(function(track) {
+	  track.enabled = true;
+	});
+    window.stream = stream;
+    video.srcObject = stream;
+	video.onloadedmetadata = function(e) {
+		video.play()
+	}
+}
+
+function pauseStreaming() {
+	stream.getTracks().forEach(function(track) {
+	  track.enabled = false;
+	});
+	video.pause();
+}
+
+function stopStreaming() {
+	stream.getTracks().forEach(function(track) {
+	  track.stop();
+	});
+	video.pause();
+	stream = null;
+	window.stream = null;
+    video.srcObject = null;
+}
+
+function dataURItoBlob(dataURI) {
+  // convert base64 to raw binary data held in a string
+  // doesn't handle URLEncoded DataURIs - see SO answer #6850276 for code that does this
+  var byteString = atob(dataURI.split(',')[1]);
+
+  // separate out the mime component
+  var mimeString = dataURI.split(',')[0].split(':')[1].split(';')[0]
+
+  // write the bytes of the string to an ArrayBuffer
+  var ab = new ArrayBuffer(byteString.length);
+
+  // create a view into the buffer
+  var ia = new Uint8Array(ab);
+
+  // set the bytes of the buffer to the correct values
+  for (var i = 0; i < byteString.length; i++) {
+      ia[i] = byteString.charCodeAt(i);
+  }
+
+  // write the ArrayBuffer to a blob, and you're done
+  var blob = new Blob([ab], {type: mimeString});
+  return blob;
+}
+
+// points are in clockwise order
+function drawPoly(ctx, points, color) {
+	ctx.strokeStyle = color;
+	ctx.lineWidth = 2;
+	ctx.beginPath();
+	ctx.moveTo(points[0][0], points[0][1]);
+	for (var i = 1; i < points.length; i++) {
+		ctx.lineTo(points[i][0], points[i][1]);
+	}
+	ctx.closePath();
+	ctx.stroke();
+	// points.forEach(point => {
+	// 	ctx.beginPath();
+	// 	ctx.moveTo(point[0], point[1]);
+	// 	ctx.arc(point[0], point[1], 4, 0, 2 * Math.PI, false);
+	// 	ctx.fillStyle = 'green';
+	// 	ctx.fill();
+	// });
+}
+
+function section(p1, p2, num, den) {
+	const x1 = p1[0], y1 = p1[1];
+	const x2 = p2[0], y2 = p2[1];
+	const xn = ((num * x2) + ((den - num)* x1))/den;
+	const yn = ((num * y2) + ((den - num)* y1))/den;
+	return [xn, yn];
+}
+
+function distance(p1, p2) {
+	return Math.sqrt(Math.pow(p1[0] - p2[0], 2) + Math.pow(p1[1] - p2[1], 2));
+}
+
+function scaleCoordinates(p) {
+	return [p[0] * xscale, p[1] * yscale];
+}
+
+function drawText(ctx, text, topLeft, topRight, bottomRight, bottomLeft) {
+	const len = text.length;
+
+	const maxWidth = distance(bottomLeft, bottomRight) / len;
+	// console.log("Text coord =", topLeft, topRight, bottomRight, bottomLeft, " len =", len);
+	for(var i = 0; i < len; i++) {
+		const newBottomLeft = section(bottomLeft, bottomRight, i, len);
+		const newTopLeft = section(topLeft, topRight, i, len);
+
+		const heightPx = newBottomLeft[1] - newTopLeft[1];
+		// console.log("Text style: heightPx=", heightPx, " maxWidth=", maxWidth, newBottomLeft);
+		ctx.font = heightPx + "px Verdana"; 
+		ctx.fillText(text[i], newBottomLeft[0], newBottomLeft[1], maxWidth);
+	}
+}
+
+async function annotateAllText() {
+	// This has CORS permissions issues, so using the hack above.
+	// const data = await fetch('/imgcap01.json')
+	// 	.then(response => response.json());
+
+	const canvas = document.getElementById('canvas');
+	const ctx = canvas.getContext('2d');
+
+	const readResults = data.analyzeResult.readResults;
+	readResults.forEach(readResult => {
+		readResult.lines.forEach(line => {
+			line.words.forEach(word => {
+				annotateWord(ctx, word);
+			});
+		});
+	});
+	// spellcheck(data, ctx);
+}
+
+function offsetBy(point, widthPerCharPx, offsetWidthMultiple, heightPx, offsetHeightMultiple) {
+	const offsetPoint = [point[0] + (widthPerCharPx * offsetWidthMultiple), point[1] + (heightPx * offsetHeightMultiple)];
+	// console.log('offsetPoint', point, widthPerCharPx,  offsetWidthMultiple, heightPx, offsetHeightMultiple);
+	return offsetPoint;
+}
+
+class BoundingBox {
+	constructor(bb) {
+		this.topLeft = scaleCoordinates([bb[0], bb[1]]);
+		this.topRight = scaleCoordinates([bb[2], bb[3]]);
+		this.bottomRight = scaleCoordinates([bb[4], bb[5]]);
+		this.bottomLeft = scaleCoordinates([bb[6], bb[7]]);
+		this.deriveVars();
+	}
+
+	deriveVars() {
+		this.heightPx = this.bottomLeft[1] - this.topLeft[1];
+		this.maxWidth = this.topRight[0] - this.topLeft[0];
+		this.points = [this.topLeft, this.topRight, this.bottomRight, this.bottomLeft];
+	}
+
+	newOffsetBy(widthPerCharPx, offsetWidthMultiple, heightPx, offsetHeightMultiple) {
+		// const offsetPoints = this.points.map(p => offsetBy(p, widthPerCharPx, offsetWidthMultiple, heightPx, offsetHeightMultiple));
+		// console.log('offsetPoints', offsetPoints);
+		// const flatPoints = [].concat(...offsetPoints);
+		// console.log('flatPoints', flatPoints);
+		// const bb = new BoundingBox(flatPoints);
+		
+		// console.log('offset params:', widthPerCharPx, offsetWidthMultiple, heightPx, offsetHeightMultiple);
+		// console.log('Before', [this.topLeft, this.topRight, this.bottomRight, this.bottomLeft]);
+		const bb = new BoundingBox(Array(8).fill(0));
+		bb.topLeft = offsetBy(this.topLeft, widthPerCharPx, offsetWidthMultiple, heightPx, offsetHeightMultiple);
+		bb.topRight = offsetBy(this.topRight, widthPerCharPx, offsetWidthMultiple, heightPx, offsetHeightMultiple);
+		bb.bottomRight = offsetBy(this.bottomRight, widthPerCharPx, offsetWidthMultiple, heightPx, offsetHeightMultiple);
+		bb.bottomLeft = offsetBy(this.bottomLeft, widthPerCharPx, offsetWidthMultiple, heightPx, offsetHeightMultiple);
+		bb.deriveVars();
+		
+		// console.log('Offset', [bb.topLeft, bb.topRight, bb.bottomRight, bb.bottomLeft]);
+		return bb;
+	}
+}
+
+function annotateWord(ctx, word, drawBox=false, offsetWidthMultiple=0, offsetHeightMultiple=0) {
+	const bb = new BoundingBox(word.boundingBox);
+	if (drawBox) {
+		// console.log(points);
+		drawPoly(ctx, bb.points, ctx.fillStyle);		
+	}
+
+	const widthPerCharPx = bb.maxWidth / word.text.length;
+	// console.log("Text style: heightPx=" + bb.heightPx + " maxWidth=" + bb.maxWidth);
+	const bbOffset = bb.newOffsetBy(widthPerCharPx, offsetWidthMultiple, bb.heightPx, offsetHeightMultiple)
+	// ctx.font = bbOffset.heightPx + "px Verdana";
+	// ctx.fillText(word.text, bottomLeft[0], bottomLeft[1], maxWidth);
+	drawText(ctx, word.text, bbOffset.topLeft, bbOffset.topRight, bbOffset.bottomRight, bbOffset.bottomLeft);
+}
+
+class RelativeLine {
+	constructor(lineNo, lineNoFrom, distance) {
+		this.lineNo = lineNo;
+		this.lineNoFrom = lineNoFrom;
+		this.distance = distance;
+		// this.lineTo = this.lineTo;
+	}
+}
+
+function getDistanceBoxMap(lines) {
+	const distanceMap = {};
+	const boxMap = {}
+	const allDistances = [];
+	// the returned lines are roughly in order form top left to bottom right, but when across two pages it messes things up
+	for (var i = 0; i < lines.length; i++) {
+		const line1 = lines[i];
+		const bb1 = new BoundingBox(line1.boundingBox);
+		line1.newBoundingBox = bb1;
+		// boxMap[i] = bb1;
+		distanceMap[i] = [];
+		for (var j = i + 1; j < lines.length; j++) {
+			const line2 = lines[j];
+			const bb2 = new BoundingBox(line2.boundingBox);
+			line2.newBoundingBox = bb2;
+			// boxMap[j] = bb2;
+			// const dist =distance(bb1.topLeft, bb2.topLeft);
+			// distanceMap[i].push(new RelativeLine(j, i, dist));
+			// allDistances.push(dist);
+		}
+		distanceMap[i] = distanceMap[i].sort((rl1, rl2) => {
+			return rl1.distance - rl2.distance;
+		});
+	}
+	return {"distanceMap": distanceMap, "boxMap": boxMap, "allDistances": allDistances};
+}
+
+function getCentroid(coords) {
+  var signedArea = 0;
+  var x = 0;
+  var y = 0;
+  
+  for (var i = 0; i < coords.length - 1; i++) {
+    var temp = (coords[i][0] * coords[i + 1][1]) - (coords[i + 1][0] * coords[i][1]);
+    
+    signedArea += temp;
+    x += (coords[i][0] + coords[i + 1][0]) * temp;
+    y += (coords[i][1] + coords[i + 1][1]) * temp;
+  }
+  
+  signedArea *= 0.5;
+  x /= 6 * signedArea;
+  y /= 6 * signedArea;
+  
+  return [Math.round(x), Math.round(y)];
+}
+
+function getCenter(bb) {
+	return [(bb.topLeft[0] + bb.topRight[0])/2, (bb.topLeft[1] + bb.bottomRight[1])/2]
+}
+
+function isAlignedWithin(pt1, pt2, axis /* 0 = x, 1 = y*/, tolerance) {
+	const lower = pt1[axis] - tolerance;
+	const upper = pt1[axis] + tolerance;
+	// console.log('Cmp @', pt2[axis], lower, pt2[axis], upper);
+	return (pt2[axis] > lower && pt2[axis] <= upper);
+}
+
+function clusterLines(readResult, highlightOrderedLines=false) {
+	const distanceBoxMap = getDistanceBoxMap(readResult.lines);
+	const distanceMap = distanceBoxMap.distanceMap;
+	const boxMap = distanceBoxMap.boxMap;
+	console.log(boxMap);
+
+	// find most common distance bucket
+	// const buckets = bucketize(distanceBoxMap.allDistances);
+
+	const len = readResult.lines.length;
+	const orderedLines = [];
+	const orderedLinesPreviousIndex = [];
+	
+	/*
+	const visited = new Set();
+	for (var i = 0; i < len; i++) {
+		if (visited.has(i)) {
+			continue;
+		}
+		const line1 = readResult.lines[i];
+		orderedLines.push(line1);
+		orderedLinesPreviousIndex.push(i);
+		visited.add(i)
+		const sortedByDistance = distanceMap[i];
+		// get the next closest line that is not already visited
+		for (var j = 0; j < sortedByDistance.length; j++) {
+			const rl = sortedByDistance[j];
+			if(!visited.has(rl.lineNo)) {
+				const line2 = readResult.lines[rl.lineNo];
+				orderedLines.push(line2);
+				orderedLinesPreviousIndex.push(rl.lineNo);
+				visited.add(rl.lineNo);
+				console.log('Closest: ', i, ':', line1.text, '-(' + rl.distance + ')->', rl.lineNo, ':', line2.text);
+				break;
+			}
+		}
+	}*/
+	const clustered = new Set();
+	const xClusters = [];
+	var nClusters = 0;
+	const xTolerancePercent = 20;
+	const tolerance = ((displayWidth * xTolerancePercent) / 100);
+	for (var i = 0; i < len; i++) {
+		if (clustered.has(i)) {
+			continue;
+		}
+		const line1 = readResult.lines[i];
+		const cluster = [];
+		cluster.push(i);
+		xClusters.push(cluster);
+		clustered.add(i);
+		const bb1 = line1.newBoundingBox; //boxMap[i];
+		// console.log('bb1', bb1);
+
+		for (var j = i + 1; j < len; j++) {
+			if (clustered.has(j)) {
+				continue;
+			}
+			const line2 = readResult.lines[j];
+			const bb2 = line2.newBoundingBox; // boxMap[j];
+			if (isAlignedWithin(bb1.topLeft, bb2.topLeft, 0, tolerance)) {
+				// console.log('line2 @ ' +j, line2.text);
+				// console.log('cluster', cluster);
+				cluster.push(j);
+				clustered.add(j);
+			}
+		}
+	}
+
+	// console.log('xClusters', xClusters);
+	// console.log('xClusterLines', xClusters.map(c => { return c.map(clno => {return readResult.lines[clno].newBoundingBox.topLeft[0] + ': ' + readResult.lines[clno].text})}));
+	for (var i = 0; i < xClusters.length; i++) {
+		// the ordering within a page returned by the Azure API is mostly correct.
+		const clusteredLines = xClusters[i].map((val, index) => readResult.lines[val]);
+		orderedLines.push(...clusteredLines);
+
+		/*
+		// now sort by y
+		const ySortedClusteredLines = clusteredLines.sort((l1, l2) => {
+			// return boxMap[l1].topLeft[1] - boxMap[l1].topLeft[1];
+			// return l1.boundingBox[0] - l2.boundingBox[0];
+			return l1.newBoundingBox.topLeft[1] - l2.newBoundingBox.topLeft[1];
+		});
+		console.log('ySortedClusteredLines', ySortedClusteredLines);
+		orderedLines.push(...ySortedClusteredLines);*/
+		
+	}
+
+	// cluster along topLeft x-axis to group by pages / columns
+
+	console.log('ORDERED LINES', orderedLines);
+	const canvas = document.getElementById('canvas');
+	const ctx = canvas.getContext('2d');
+
+	if (highlightOrderedLines) {
+		for (var i = 0; i < orderedLines.length - 1; i++) {
+			const line1 = orderedLines[i];
+			const line2 = orderedLines[i + 1];
+			const bb1 = line1.newBoundingBox;
+			const bb2 = line2.newBoundingBox
+			// const bb1 = boxMap[orderedLinesPreviousIndex[i]];
+			// const bb2 = boxMap[orderedLinesPreviousIndex[i + 1]];
+			drawPoly(ctx, bb1.points, 'black');
+			drawPoly(ctx, bb2.points, 'black');
+			// console.log('Line1', line1.text, 'box', bb1.points);
+			// console.log('Line2', line2.text, 'box', bb2.points);
+			// const c1 = bb1.topLeft;
+			// const c2 = bb2.topLeft;
+			const c1 = getCenter(bb1);
+			const c2 = getCenter(bb2);
+			// const c1 = getCentroid(bb1.points);
+			// const c2 = getCentroid(bb2.points);
+			// console.log('Centroids', c1, c2);
+			ctx.beginPath();
+			ctx.moveTo(c1[0], c1[1]);
+			ctx.lineTo(c2[0], c2[1]);
+			ctx.closePath();
+			ctx.stroke();
+		}	
+	}
+	return orderedLines;
+}
+
+function compileText(ocrData, highlightOrderedLines=false) {
+	let text = "";
+	const offsetMap = {};
+	const readResults = ocrData.analyzeResult.readResults;
+	readResults.forEach(readResult => {
+		const orderedLines = clusterLines(readResult, highlightOrderedLines);
+		orderedLines.forEach(line => {
+			line.words.forEach(word => {
+				offsetMap[text.length] = word;
+				text += word.text + " ";
+			});
+			// text += '\n';
+		});
+	});
+	console.log(text);
+	return {"offsetMap": offsetMap, "text": text};	
+}
+
+async function check() {
+	AZURE_KEY_SPC = document.getElementById('azureKeySpc').value;
+	if (!AZURE_KEY_SPC) {
+		setError("MUST SET KEY FOR SPELLCHECK. Aborting");
+		return;
+	}
+	writeToLocalStorage("azureKeySpc", AZURE_KEY_SPC);
+
+	const compiledText = compileText(data);
+	const text = compiledText.text;
+
+	const body = new URLSearchParams(); 
+	body.append('text', text);
+
+	const response = await fetch("https://api.bing.microsoft.com/v7.0/spellcheck", {
+	  method: 'POST',
+	  headers: {
+		"Content-Type": "application/x-www-form-urlencoded",
+		"Ocp-Apim-Subscription-Key": AZURE_KEY_SPC
+	  },
+	  body: body
+	})
+	if (!response.ok) {
+		console.log(response.status);
+		setError('Failed to get response for spellcheck: ' + response.status);
+		return;
+	}
+	console.log(response.headers);
+	spellcheckResults = await response.json();
+	console.log('received spellcheckResults', spellcheckResults);
+	highlight(compiledText);
+}
+
+function allowFlaggedToken(ftoken) {
+	const text = ftoken.token.toLowerCase();
+	if (text in ALLOW_LISTED_WORDS) {
+		console.log("Allow listed \"" + ftoken.token +"\" reason: " + ALLOW_LISTED_WORDS[text]);
+		return true;
+	}
+	return false;
+}
+
+function highlight(compiledText=null, highlightOrderedLines=false) {
+	clearMsgs();
+	const canvas = document.getElementById('canvas');
+	const ctx = canvas.getContext('2d');
+	console.log('highlighting spellcheckResults', spellcheckResults);
+	console.log(ALLOW_LISTED_WORDS);
+
+	const offsetMap = compiledText !== null ? compiledText.offsetMap : compileText(data, highlightOrderedLines).offsetMap;
+	// console.log(offsetMap);
+	console.log('Canvas dims', displayWidth, displayHeight, 'scale:', xscale, yscale);
+	ctx.fillStyle = 'red';
+	spellcheckResults.flaggedTokens.forEach(ftoken => {
+		if (allowFlaggedToken(ftoken)) {
+			return;
+		}
+		if (ftoken.offset in offsetMap) {
+			const word = offsetMap[ftoken.offset];
+			console.log('Word "' + ftoken.token + '" at', ftoken.offset, ' suggestions: ', ftoken.suggestions);
+			annotateWord(ctx, word, true, 0, -1.2);
+		} else {
+			console.log('Word "' + ftoken.token + '" at', ftoken.offset, ' not found in offsetMap');
+		}
+	});
+}
+
+function highlightOrderedLines() {
+	const showOrdering = document.getElementById("highlightOrderedLines").checked;
+	if (showOrdering) {
+		highlight(null, true);
+	} else {
+		loadDefaultImage(true);
+	}
+}
+
+</script>
+<style>  
+.errorMsg  
+{  
+	color:red;
+	font: bold
+}
+</style>
+</head>
+<body onload="javascript:init()">
+	<h1>Spellcheck Your Handwritten Text</h1>
+<p><span class="errorMsg" id="errorMsg"></span></p>
+<p><span id="notification"></span></p>
+
+<!-- Trigger canvas web API -->
+<div class="controller">
+    <button id="start" onclick="javascript:start()">Start Cam</button>
+    <button id="stop" onclick="javascript:stop()">Stop Cam</button>
+	<br>
+	<b>Ensure you procure and fill in these API keys</b>
+	<table border="0">
+		<tr>
+			<td>Azure Key for OCR</td>
+			<td><input type="text" id="azureKeyOcr" autocomplete="on"/></td>
+		</tr>
+		<tr>
+			<td>Azure Key for SpellCheck</td>
+			<td><input type="text" id="azureKeySpc" autocomplete="on"/></td>
+		</tr>
+	</table>
+</div>
+
+
+<!-- <div id="preload"  style="display:block">
+	<div class="imgcap">
+	    <img src="./imgcap01.png" onload="javascript:annotateAllText()"/>
+	</div>
+</div>
+ -->
+
+<!-- Stream video via webcam -->
+<div id="camera"  style="display:none">
+	<div class="video-wrap">
+	    <video id="video" playsinline autoplay muted></video>
+	</div>
+
+	<div class="controller">
+	    <button id="snap">Capture</button>
+	</div>
+</div>
+<div id="check" style="display:none">
+	<!-- Webcam video snapshot -->
+	<canvas id="canvas" width="320" height="480"></canvas>
+	<div class="controller">
+	    <button id="scan" onclick="javascript:scan()">Scan</button>
+	</div>
+	<div class="controller">
+	    <textarea id="oploc" rows="1" cols="1024"></textarea>
+	</div>
+	<div class="controller">
+	    <button id="poll" onclick="javascript:poll()">Poll Scan</button>
+	    <button id="check" onclick="javascript:check()">Check</button>
+	    <input type="checkbox" id="highlightOrderedLines" onclick="javascript:highlightOrderedLines()">Highlight Clustered Lines</button>
+	    <button id="highlight" onclick="javascript:highlight()">Highlight Errors</button>
+	</div>
+</div>
+</body>
+</html>
